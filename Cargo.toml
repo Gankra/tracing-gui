@@ -1,0 +1,21 @@
+[package]
+name = "tracing-gui"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+chrono = "0.4.19"
+clap = { version = "3.2.16", features = ["derive"] }
+eframe = "0.18.0"
+egui = "0.18.1"
+egui_extras = "0.18.0"
+linear-map = { version = "1.2.0", features = ["serde_impl"] }
+miette = "5.1.1"
+rfd = "0.10.0"
+serde = { version = "1.0.140", features = ["derive"] }
+serde_json = "1.0.82"
+thiserror = "1.0.31"
+tokio = "1.20.1"
+tracing = "0.1.36"

@@ -1,0 +1,450 @@
+use std::fmt::Write;
+use std::{
+    collections::{BTreeMap, HashMap},
+    ops::Range,
+    sync::{Arc, Mutex},
+};
+
+use chrono::{DateTime, Local, SecondsFormat};
+use serde::Deserialize;
+use tracing::Level;
+
+const ROOT_SPAN: SpanId = 0;
+const JSON_MESSAGE_KEY: &str = "message";
+const JSON_SPAN_NAME_KEY: &str = "name";
+
+#[derive(Debug, Clone)]
+pub struct Logs {
+    pub inner: Arc<Mutex<LogsInner>>,
+}
+
+pub type SpanId = u64;
+pub type MessageId = u64;
+
+#[derive(Debug, Clone, Default)]
+pub struct LogsInner {
+    pub root_span: SpanId,
+    pub spans: BTreeMap<SpanId, SpanEntry>,
+    pub messages: BTreeMap<MessageId, MessageEntry>,
+
+    pub last_query: Option<Query>,
+    pub cur_string: Option<Arc<String>>,
+
+    pub next_span_id: SpanId,
+    pub next_message_id: MessageId,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct SpanEntry {
+    pub name: String,
+    pub fields: BTreeMap<String, Value>,
+    pub events: Vec<EventEntry>,
+    pub json_subspan_keys: HashMap<JsonSpan, SpanId>,
+}
+
+#[derive(Debug, Clone)]
+pub enum EventEntry {
+    Span(SpanId),
+    Message(MessageId),
+}
+
+#[allow(dead_code)]
+#[derive(Default, Debug, Clone)]
+pub struct MessageEntry {
+    pub timestamp: Option<DateTime<Local>>,
+    pub level: Option<Level>,
+    pub fields: PsuedoMap<String, Value>,
+    pub _target: String,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Query {
+    All,
+    Span(SpanId),
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct JsonMessage<'a> {
+    timestamp: &'a str,
+    level: &'a str,
+    fields: PsuedoMap<String, Value>,
+    target: &'a str,
+    #[serde(default)]
+    spans: Vec<JsonSpan>,
+}
+
+type JsonSpan = PsuedoMap<String, Value>;
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[serde(untagged)]
+pub enum Value {
+    S(String),
+    B(bool),
+    I(i64),
+    M(PsuedoMap<String, Value>),
+    A(Vec<Value>),
+}
+
+/// This is kind of a map but `tracing` can end up with `name` twice so it's just `Vec<(K, V)>`
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+pub struct PsuedoMap<K, V> {
+    pub vals: Vec<(K, V)>,
+}
+
+impl<K, V> Default for PsuedoMap<K, V> {
+    fn default() -> Self {
+        Self {
+            vals: Default::default(),
+        }
+    }
+}
+
+pub fn print_indent(output: &mut String, depth: usize) {
+    write!(output, "{:indent$}", "", indent = depth * 4).unwrap();
+}
+pub fn print_val(output: &mut String, _depth: usize, val: &Value) {
+    match val {
+        Value::S(v) => write!(output, "{}", v).unwrap(),
+        Value::B(v) => write!(output, "{}", v).unwrap(),
+        Value::I(v) => write!(output, "{}", v).unwrap(),
+        Value::M(v) => write!(output, "{:?}", v.vals).unwrap(),
+        Value::A(v) => write!(output, "{:?}", v).unwrap(),
+    }
+}
+
+pub fn print_span_header(output: &mut String, depth: usize, span: &SpanEntry) {
+    if !span.name.is_empty() {
+        print_indent(output, depth);
+        write!(output, "[{}", span.name).unwrap();
+        for (k, v) in &span.fields {
+            write!(output, ", {k} = ").unwrap();
+            print_val(output, depth, v);
+        }
+        writeln!(output, "]").unwrap();
+    }
+}
+
+pub fn print_span_recursive(
+    output: &mut String,
+    spans: &BTreeMap<SpanId, SpanEntry>,
+    messages: &BTreeMap<MessageId, MessageEntry>,
+    depth: usize,
+    span: &SpanEntry,
+    range: Option<Range<usize>>,
+) {
+    print_span_header(output, depth, span);
+
+    let event_range = if let Some(range) = range {
+        &span.events[range]
+    } else {
+        &span.events[..]
+    };
+    for event in event_range {
+        match event {
+            EventEntry::Message(message_id) => {
+                let entry = &messages[message_id];
+                let message = entry
+                    .fields
+                    .vals
+                    .iter()
+                    .find(|(k, _v)| k == JSON_MESSAGE_KEY);
+                print_indent(output, depth + 1);
+                if let Some(level) = entry.level {
+                    write!(output, "[{:5}] ", level).unwrap();
+                } else {
+                    write!(output, "      ").unwrap();
+                }
+                if let Some(timestamp) = &entry.timestamp {
+                    write!(
+                        output,
+                        "[{}] ",
+                        timestamp.to_rfc3339_opts(SecondsFormat::Millis, true)
+                    )
+                    .unwrap();
+                }
+                for (k, v) in &entry.fields.vals {
+                    if k != JSON_MESSAGE_KEY {
+                        write!(output, "[{} = ", k).unwrap();
+                        print_val(output, depth, v);
+                        write!(output, "] ").unwrap();
+                    }
+                }
+                if let Some(message) = message {
+                    print_val(output, depth + 1, &message.1);
+                }
+                writeln!(output).unwrap();
+            }
+            EventEntry::Span(sub_span) => {
+                print_span_recursive(output, spans, messages, depth + 1, &spans[sub_span], None);
+            }
+        }
+    }
+}
+
+impl Logs {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(LogsInner::new())),
+        }
+    }
+
+    pub fn clear(&self) {
+        let mut log = self.inner.lock().unwrap();
+        let root_span = log.root_span;
+        let mut root = log.spans.remove(&root_span).unwrap();
+        root.events.clear();
+
+        log.spans.clear();
+        log.messages.clear();
+        log.cur_string = None;
+        log.next_message_id = 0;
+        log.next_span_id = 1;
+
+        log.spans.insert(root_span, root);
+    }
+
+    pub fn add_json_message(&self, input: &str) {
+        self.inner.lock().unwrap().add_json_message(input);
+    }
+
+    pub fn string_query(&self, query: Query) -> Arc<String> {
+        let mut log = self.inner.lock().unwrap();
+        if Some(query) == log.last_query {
+            if let Some(string) = &log.cur_string {
+                return string.clone();
+            }
+        }
+        log.last_query = Some(query);
+
+        let mut output = String::new();
+
+        let (span_to_print, range) = match query {
+            Query::All => (&log.spans[&log.root_span], None),
+            Query::Span(span) => (&log.spans[&span], None),
+        };
+
+        print_span_recursive(
+            &mut output,
+            &log.spans,
+            &log.messages,
+            0,
+            span_to_print,
+            range,
+        );
+
+        let result = Arc::new(output);
+        log.cur_string = Some(result.clone());
+        result
+    }
+}
+
+impl Default for Logs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LogsInner {
+    pub fn new() -> Self {
+        let root_span = SpanEntry {
+            name: "<all spans>".to_owned(),
+            ..SpanEntry::default()
+        };
+        let mut spans = BTreeMap::new();
+        spans.insert(ROOT_SPAN, root_span);
+        Self {
+            root_span: ROOT_SPAN,
+            spans,
+            messages: BTreeMap::new(),
+            last_query: None,
+            cur_string: None,
+            next_span_id: 1,
+            next_message_id: 0,
+        }
+    }
+
+    pub fn add_json_message(&mut self, input: &str) {
+        let json_message = match serde_json::from_str::<JsonMessage>(input) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("WARN: failed to parse log line: {}\n{}", input, e);
+                return;
+            }
+        };
+        let mut cur_span_id = self.root_span;
+        for json_span in json_message.spans {
+            let cur_span = self.spans.get_mut(&cur_span_id).unwrap();
+            cur_span_id = match cur_span.json_subspan_keys.entry(json_span) {
+                std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    // Make a new span
+                    let new_span_id = self.next_span_id;
+                    self.next_span_id += 1;
+                    let mut fields = e.key().vals.iter();
+
+                    // This is done in a weird way because if you have a span with "name" key
+                    // then tracing will emit two keys with the string "name". We assume the
+                    // one we want is first.
+                    let name = if let Some((k, Value::S(name))) = fields.next_back() {
+                        if k == JSON_SPAN_NAME_KEY {
+                            name.clone()
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+                    let new_span = SpanEntry {
+                        name,
+                        fields: fields.cloned().collect(),
+                        events: Vec::new(),
+                        json_subspan_keys: HashMap::new(),
+                    };
+
+                    e.insert(new_span_id);
+                    cur_span.events.push(EventEntry::Span(new_span_id));
+                    self.spans.insert(new_span_id, new_span);
+
+                    new_span_id
+                }
+            };
+        }
+
+        let span = self.spans.get_mut(&cur_span_id).unwrap();
+        let new_message_id = self.next_message_id;
+        self.next_message_id += 1;
+        let new_message = MessageEntry {
+            timestamp: json_message.timestamp.parse().ok(),
+            level: match json_message.level {
+                "ERROR" => Some(Level::ERROR),
+                "WARN" => Some(Level::WARN),
+                "INFO" => Some(Level::INFO),
+                "DEBUG" => Some(Level::DEBUG),
+                "TRACE" => Some(Level::TRACE),
+                _ => None,
+            },
+            _target: json_message.target.to_owned(),
+            fields: json_message.fields,
+        };
+        self.messages.insert(new_message_id, new_message);
+        span.events.push(EventEntry::Message(new_message_id));
+    }
+}
+
+#[test]
+fn test_parse_json_message_no_spans() {
+    let input = r###"{"timestamp":"2022-02-15T18:47:10.821315Z","level":"INFO","fields":{"message":"preparing to shave yaks","number_of_yaks":3},"target":"fmt_json"}"###;
+
+    let _json_message: JsonMessage = serde_json::from_str(input).unwrap();
+}
+
+#[test]
+fn test_parse_json_message_spans() {
+    let input = r###"{"timestamp":"2022-02-15T18:47:10.821495Z","level":"TRACE","fields":{"message":"hello! I'm gonna shave a yak","excitement":"yay!"},"target":"fmt_json::yak_shave","spans":[{"yaks":3,"name":"shaving_yaks"},{"yak":1,"name":"shave"}]}"###;
+
+    let _json_message: JsonMessage = serde_json::from_str(input).unwrap();
+}
+
+#[test]
+fn test_parse_json_message_dupe_name() {
+    let input = r###"{"timestamp":"2022-02-15T18:47:10.821495Z","level":"TRACE","fields":{"message":"hello! I'm gonna shave a yak","excitement":"yay!"},"target":"fmt_json::yak_shave","spans":[{"name": "real_name", "yaks":3,"name":"shaving_yaks"}]}"###;
+
+    let json_message: JsonMessage = serde_json::from_str(input).unwrap();
+    assert_eq!(
+        &json_message.spans[0].vals[0],
+        &("name".to_owned(), Value::S("real_name".to_owned()))
+    );
+    assert_eq!(
+        &json_message.spans[0].vals[1],
+        &("yaks".to_owned(), Value::I(3))
+    );
+    assert_eq!(
+        &json_message.spans[0].vals[2],
+        &("name".to_owned(), Value::S("shaving_yaks".to_owned()))
+    );
+}
+
+use std::fmt;
+use std::marker::PhantomData;
+
+impl<K, V> PsuedoMap<K, V> {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            vals: Vec::with_capacity(cap),
+        }
+    }
+}
+
+// A Visitor is a type that holds methods that a Deserializer can drive
+// depending on what is contained in the input data.
+//
+// In the case of a map we need generic type parameters K and V to be
+// able to set the output type correctly, but don't require any state.
+// This is an example of a "zero sized type" in Rust. The PhantomData
+// keeps the compiler from complaining about unused generic type
+// parameters.
+struct MyMapVisitor<K, V> {
+    marker: PhantomData<fn() -> PsuedoMap<K, V>>,
+}
+
+impl<K, V> MyMapVisitor<K, V> {
+    fn new() -> Self {
+        MyMapVisitor {
+            marker: PhantomData,
+        }
+    }
+}
+
+// This is the trait that Deserializers are going to be driving. There
+// is one method for each type of data that our type knows how to
+// deserialize from. There are many other methods that are not
+// implemented here, for example deserializing from integers or strings.
+// By default those methods will return an error, which makes sense
+// because we cannot deserialize a MyMap from an integer or string.
+impl<'de, K, V> serde::de::Visitor<'de> for MyMapVisitor<K, V>
+where
+    K: Deserialize<'de>,
+    V: Deserialize<'de>,
+{
+    // The type that our Visitor is going to produce.
+    type Value = PsuedoMap<K, V>;
+
+    // Format a message stating what data this Visitor expects to receive.
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a very special map")
+    }
+
+    // Deserialize MyMap from an abstract "map" provided by the
+    // Deserializer. The MapAccess input is a callback provided by
+    // the Deserializer to let us see each entry in the map.
+    fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+    where
+        M: serde::de::MapAccess<'de>,
+    {
+        let mut map = PsuedoMap::with_capacity(access.size_hint().unwrap_or(0));
+
+        // While there are entries remaining in the input, add them
+        // into our map.
+        while let Some((key, value)) = access.next_entry()? {
+            map.vals.push((key, value));
+        }
+
+        Ok(map)
+    }
+}
+
+// This is the trait that informs Serde how to deserialize MyMap.
+impl<'de, K, V> Deserialize<'de> for PsuedoMap<K, V>
+where
+    K: Deserialize<'de>,
+    V: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        // Instantiate our Visitor and ask the Deserializer to drive
+        // it over the input data, resulting in an instance of MyMap.
+        deserializer.deserialize_map(MyMapVisitor::new())
+    }
+}
