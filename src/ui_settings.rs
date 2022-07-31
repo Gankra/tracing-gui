@@ -49,6 +49,7 @@ impl App {
         ui.add_space(10.0);
 
         if ui.button("Open log file...").clicked() {
+            // FIXME(WASM): this has to be made async in wasm
             if let Some(path) = rfd::FileDialog::new().pick_file() {
                 self.settings.available_paths.push(path);
                 self.set_path(self.settings.available_paths.len() - 1);
