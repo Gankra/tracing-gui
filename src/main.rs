@@ -8,11 +8,13 @@ use std::{
 
 use egui::Vec2;
 use logs::Logs;
-use ui_logs::LogsUi;
+use ui_logs_linear::LinearLogsUi;
+use ui_logs_tree::TreeLogsUi;
 use ui_settings::SettingsUi;
 
 pub mod logs;
-mod ui_logs;
+mod ui_logs_linear;
+mod ui_logs_tree;
 mod ui_settings;
 
 struct App {
@@ -22,7 +24,8 @@ struct App {
     settings: Settings,
 
     tab: Tab,
-    logs_ui: LogsUi,
+    tree_logs_ui: TreeLogsUi,
+    linear_logs_ui: LinearLogsUi,
     #[allow(dead_code)]
     settings_ui: SettingsUi,
 
@@ -33,7 +36,8 @@ struct App {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Tab {
     Settings,
-    Logs,
+    TreeLogs,
+    LinearLogs,
 }
 
 #[derive(Debug, Clone)]
@@ -96,7 +100,8 @@ fn main() {
                     picked_path: None,
                 },
                 tab: Tab::Settings,
-                logs_ui: LogsUi::default(),
+                linear_logs_ui: LinearLogsUi::default(),
+                tree_logs_ui: TreeLogsUi::default(),
                 settings_ui: SettingsUi::default(),
                 task_sender,
                 status_receiver,
@@ -183,7 +188,7 @@ impl App {
         let (lock, condvar) = &*self.task_sender;
         let mut new_task = lock.lock().unwrap();
         *new_task = Some(ProcessorTask::OpenLogs(path));
-        self.tab = Tab::Logs;
+        self.tab = Tab::TreeLogs;
         condvar.notify_one();
     }
 
@@ -197,16 +202,17 @@ impl App {
 
 impl App {
     fn update_ui(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Settings, "settings");
-                ui.selectable_value(&mut self.tab, Tab::Logs, "logs");
+                ui.selectable_value(&mut self.tab, Tab::LinearLogs, "linear logs");
+                ui.selectable_value(&mut self.tab, Tab::TreeLogs, "tree logs");
             });
-            ui.separator();
-            match self.tab {
-                Tab::Settings => self.ui_settings(ui, ctx),
-                Tab::Logs => self.ui_logs(ui, ctx),
-            }
+        });
+        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
+            Tab::Settings => self.ui_settings(ui, ctx),
+            Tab::LinearLogs => self.ui_logs_linear(ui, ctx),
+            Tab::TreeLogs => self.ui_logs_tree(ui, ctx),
         });
     }
 }

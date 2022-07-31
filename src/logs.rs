@@ -81,7 +81,7 @@ pub fn print_val(output: &mut String, _depth: usize, val: &IValue) {
     }
 }
 
-pub fn print_span_header(output: &mut String, depth: usize, span: &SpanEntry) {
+pub fn print_span_header(output: &mut String, depth: usize, span: &SpanEntry, line_break: bool) {
     if !span.name.is_empty() {
         print_indent(output, depth);
         write!(output, "[{}", span.name).unwrap();
@@ -89,7 +89,10 @@ pub fn print_span_header(output: &mut String, depth: usize, span: &SpanEntry) {
             write!(output, ", {k} = ").unwrap();
             print_val(output, depth, v);
         }
-        writeln!(output, "]").unwrap();
+        write!(output, "]").unwrap();
+        if line_break {
+            writeln!(output).unwrap();
+        }
     }
 }
 
@@ -100,7 +103,7 @@ pub fn print_span_recursive(
     span: &SpanEntry,
     range: Option<Range<usize>>,
 ) {
-    print_span_header(output, depth, span);
+    print_span_header(output, depth, span, true);
 
     let event_range = if let Some(range) = range {
         &span.events[range]
