@@ -168,6 +168,9 @@ impl Logs {
         log.next_message_id = 0;
         log.next_span_id = 1;
 
+        // TODO: probably should clear the interner but then also have to
+        // carefully reinsert the builtin strings.
+
         log.spans.insert(root_span, root);
     }
 
